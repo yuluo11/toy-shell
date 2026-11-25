@@ -11,7 +11,7 @@
 - valgrind
 
 ## 语言
-- golang/c++
+- c++
 
 ## 参考资料
 - man手册
