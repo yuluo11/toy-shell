@@ -1,15 +1,19 @@
 #include<iostream>
 #include<string>
-#include <cerrno>
-#include <cstdio>
-#include <cstring>
-#include <sstream>
-#include <vector>
+#include<cerrno>
+#include<cstdio>
+#include<cstring>
+#include<sstream>
+#include<vector>
+#include<filesystem>
+#include<optional>
 
 #include<signal.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
+#include<sys/types.h>
+#include<sys/wait.h>
+#include<unistd.h>
+#include<fcntl.h>
+
 
 //这里要考虑可重入问题不能用cont，cerr等
 namespace{
@@ -23,6 +27,10 @@ namespace{
     }
 
 }
+
+namespace fs=std::filesystem;
+
+std::optional<fs::path>pre_dir;
 
 int lstatus=0;
 
@@ -76,8 +84,7 @@ int main(){
         }
 
         
-        if(line=="exit")
-            break;
+        
         
         if(line.empty())
             continue;
@@ -86,19 +93,113 @@ int main(){
         std::vector<std::string> tokens;
         std::string token;
 
-        while(is>>token)
-            tokens.push_back(token);
-        
+        //分词
+        for(std::string word;is>>word;)
+            tokens.push_back(std::move(word));
+
+        //判空
         if(tokens.empty())
             continue;
 
+        //解析重定向
+        std::vector<std::string>cmd_args;
+        std::optional<std::string>infile,outfile;
+
+        bool is_append=false;
+        
+        const char* syntax_error = nullptr;
+        const auto is_op=[](const std::string& token) {
+            return token=="<"||token==">"||token ==">>"||
+                    token =="|"|| token=="&";
+        };
+
+        for(std::size_t i=0;i<tokens.size();i++){
+            const auto & token=tokens[i];
+
+            if(!is_op(token)){
+                cmd_args.push_back(token);
+                continue;
+            }
+
+            if(i+1==tokens.size()|| is_op(token)){
+                syntax_error="expected a filename after redirection operator";
+                break;
+            }
+
+            const bool is_in=token=="<";
+            auto& file=is_in?infile:outfile;
+            //防止重复重定向
+            if(file.has_value()){
+                syntax_error=is_in?"duplicate input redirection":"duplicate output redirection";
+                break;
+            }
+
+            file=tokens[++i];
+
+            //判断是否追加
+            if(!is_in)
+                is_append=(token==">>");
+        }
+        if(syntax_error||cmd_args.empty()){
+            std::cerr<<(syntax_error?syntax_error:"missing command")<<std::endl;
+            lstatus=2;
+            continue;
+        }
+
+        //处理内置命令
+        if(cmd_args[0]=="exit")
+            break;
+        
+        if(cmd_args[0]=="cd"){
+            if(cmd_args.size()!=2){
+                std::cerr<<"cd: expected one argument\n";
+                lstatus=2;
+                continue;
+            }
+            const bool go_back=tokens[1]=="-";
+
+            if(go_back&&!pre_dir){
+                std::cerr<<"cd: no previous dir\n";
+                lstatus=1;
+                continue;
+            }
+
+            const fs::path target=go_back?*pre_dir:fs::path(tokens[1]);
+
+            //关闭异常抛出
+            std::error_code ec;
+            const fs::path cur_dir=fs::current_path(ec);
+
+            if(ec){
+                std::cerr<<"cd cannot get current dir\n";
+                lstatus=1;
+                continue;
+            }
+
+            if(chdir(target .c_str())==-1){
+                std::perror("cd");
+                lstatus=1;
+                continue;
+            }
+
+            pre_dir=cur_dir;
+            lstatus=0;
+
+            if (go_back) {
+            std::cout << target.string() << '\n';
+            }
+
+            continue;
+        }
+
+        //构造argv
         std::vector< char*> argv;
 
-        for(std::string &arg:tokens)
+        for(std::string &arg:cmd_args)
             argv.push_back(arg.data());
 
         argv.push_back(nullptr);
-
+        
         pid_t pid=fork();
         
         switch(pid){
@@ -130,13 +231,53 @@ int main(){
                     _exit(126);
                 }
 
+                //输入重定向
+                if(infile.has_value()){
+                    int in_fd=open(infile->c_str(),O_RDONLY);
+
+                    if(in_fd==-1){
+                        std::perror(infile->c_str());
+                        _exit(1);
+                    }
+
+                    if(in_fd!=STDIN_FILENO){
+                        if(dup2(in_fd,STDIN_FILENO)==-1){
+                            std::perror("dup2");
+                            close(in_fd);
+                            _exit(1);
+                        }
+                        close(in_fd);
+                    }
+                }
+
+                //输出重定向
+                if(outfile.has_value()){
+                    int flags=O_WRONLY|O_CREAT|(is_append?O_APPEND:O_TRUNC);
+                    int out_fd=open(outfile->c_str(),flags,0666);
+
+                    if(out_fd==-1){
+                        std::perror(outfile->c_str());
+                        _exit(1);
+                    }
+
+                    if(out_fd!=STDOUT_FILENO){
+                        if(dup2(out_fd,STDOUT_FILENO)==-1){
+                            std::perror("dup2");
+                            close(out_fd);
+                            _exit(1);
+
+                        }
+                        close(out_fd);
+                    }
+                }
+                
                 if(execvp(argv[0], argv.data()) == -1) {
                     int exec_error = errno;
 
                     std::fprintf(
                         stderr,
                         "toysh: %s: %s\n",
-                        tokens[0].c_str(),
+                        cmd_args[0].c_str(),
                         std::strerror(exec_error)
                     );
 
